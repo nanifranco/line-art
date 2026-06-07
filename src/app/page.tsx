@@ -1,0 +1,692 @@
+"use client";
+
+import { useState, useRef, useCallback, useEffect } from "react";
+import { svgToGcode } from "@/lib/gcodeGenerator";
+
+type StyleType =
+  | "lineArt"
+  | "stippling"
+  | "hatching"
+  | "crosshatch"
+  | "spiral"
+  | "waves";
+
+interface StyleOptions {
+  lineArt: { threshold: number; blur: number };
+  stippling: { numPoints: number; maxRadius: number };
+  hatching: { lineSpacing: number; angle: number; threshold: number };
+  crosshatch: { lineSpacing: number };
+  spiral: { spacing: number; maxDisplacement: number };
+  waves: { rowSpacing: number; maxAmplitude: number };
+}
+
+const defaultOptions: StyleOptions = {
+  lineArt: { threshold: 40, blur: 1.5 },
+  stippling: { numPoints: 15000, maxRadius: 3 },
+  hatching: { lineSpacing: 8, angle: 45, threshold: 0.7 },
+  crosshatch: { lineSpacing: 8 },
+  spiral: { spacing: 7, maxDisplacement: 8 },
+  waves: { rowSpacing: 10, maxAmplitude: 10 },
+};
+
+interface StyleDef {
+  id: StyleType;
+  name: string;
+  desc: string;
+  icon: string;
+}
+
+const styles: StyleDef[] = [
+  { id: "lineArt", name: "Line Art", desc: "Sobel edge detection + vector trace", icon: "LA" },
+  { id: "stippling", name: "Stippling", desc: "Dot density from brightness", icon: "ST" },
+  { id: "hatching", name: "Hatching", desc: "Diagonal line shading", icon: "HA" },
+  { id: "crosshatch", name: "Crosshatch", desc: "Multi-angle line layers", icon: "CH" },
+  { id: "spiral", name: "Spiral", desc: "Archimedean continuous path", icon: "SP" },
+  { id: "waves", name: "Waves", desc: "Sine rows by brightness", icon: "WA" },
+];
+
+function SliderRow({
+  label,
+  value,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex justify-between items-center">
+        <span className="text-xs text-zinc-400">{label}</span>
+        <span className="text-xs text-zinc-300 font-mono">{value}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(parseFloat(e.target.value))}
+        className="w-full"
+      />
+    </div>
+  );
+}
+
+function StyleIcon({ id }: { id: StyleType }) {
+  const size = 28;
+  if (id === "lineArt") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none">
+        <rect x="4" y="13" width="20" height="2" fill="currentColor" opacity="0.3" />
+        <path d="M8 8 L20 8 M6 12 L22 12 M4 16 L24 16 M6 20 L22 20 M8 24 L20 24" stroke="currentColor" strokeWidth="1.2" />
+      </svg>
+    );
+  }
+  if (id === "stippling") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="currentColor">
+        <circle cx="7" cy="7" r="1.5" /><circle cx="14" cy="5" r="1" /><circle cx="21" cy="8" r="2" />
+        <circle cx="5" cy="14" r="1.2" /><circle cx="11" cy="12" r="2.2" /><circle cx="18" cy="13" r="1.8" /><circle cx="24" cy="11" r="1" />
+        <circle cx="8" cy="20" r="2.5" /><circle cx="15" cy="19" r="1.5" /><circle cx="22" cy="21" r="1" />
+        <circle cx="4" cy="24" r="1" /><circle cx="12" cy="25" r="1.8" /><circle cx="19" cy="23" r="2" /><circle cx="25" cy="25" r="1.2" />
+      </svg>
+    );
+  }
+  if (id === "hatching") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.2">
+        <line x1="4" y1="24" x2="24" y2="4" /><line x1="4" y1="18" x2="18" y2="4" />
+        <line x1="4" y1="12" x2="12" y2="4" /><line x1="10" y1="24" x2="24" y2="10" />
+        <line x1="16" y1="24" x2="24" y2="16" /><line x1="22" y1="24" x2="24" y2="22" />
+      </svg>
+    );
+  }
+  if (id === "crosshatch") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1">
+        <line x1="4" y1="24" x2="24" y2="4" /><line x1="10" y1="24" x2="24" y2="10" /><line x1="16" y1="24" x2="24" y2="16" />
+        <line x1="4" y1="4" x2="24" y2="24" /><line x1="4" y1="10" x2="18" y2="24" /><line x1="4" y1="16" x2="12" y2="24" />
+        <line x1="7" y1="4" x2="7" y2="24" /><line x1="14" y1="4" x2="14" y2="24" /><line x1="21" y1="4" x2="21" y2="24" />
+      </svg>
+    );
+  }
+  if (id === "spiral") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.2">
+        <path d="M14 14 C14 12 16 11 17 12 C19 13 19 16 17 18 C15 20 11 20 9 18 C6 15 6 10 9 7 C12 4 18 4 21 7 C24 11 24 18 21 22" />
+      </svg>
+    );
+  }
+  if (id === "waves") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.2">
+        <path d="M2 7 Q5 4 8 7 Q11 10 14 7 Q17 4 20 7 Q23 10 26 7" />
+        <path d="M2 13 Q5 9 8 13 Q11 17 14 13 Q17 9 20 13 Q23 17 26 13" />
+        <path d="M2 19 Q5 16 8 19 Q11 22 14 19 Q17 16 20 19 Q23 22 26 19" />
+        <path d="M2 25 Q5 22 8 25 Q11 28 14 25 Q17 22 20 25 Q23 28 26 25" />
+      </svg>
+    );
+  }
+  const fallback = id as string;
+  return <span className="text-xs font-bold">{fallback.slice(0, 2).toUpperCase()}</span>;
+}
+
+export default function Home() {
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const [selectedStyle, setSelectedStyle] = useState<StyleType>("lineArt");
+  const [processedSvg, setProcessedSvg] = useState<string | null>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"original" | "preview">("original");
+  const [isDragging, setIsDragging] = useState(false);
+  const [options, setOptions] = useState<StyleOptions>(defaultOptions);
+  const [gcodeWidthMm, setGcodeWidthMm] = useState(200);
+  const [gcodeHeightMm, setGcodeHeightMm] = useState(200);
+  const [gcodeFeedRate, setGcodeFeedRate] = useState(3000);
+  const [gcodePenUpCmd, setGcodePenUpCmd] = useState("M3 S0");
+  const [gcodePenDownCmd, setGcodePenDownCmd] = useState("M3 S30");
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const setOpt = useCallback(
+    <K extends StyleType>(style: K, key: keyof StyleOptions[K], value: number) => {
+      setOptions((prev) => ({
+        ...prev,
+        [style]: { ...prev[style], [key]: value },
+      }));
+    },
+    []
+  );
+
+  const handleFiles = useCallback((files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    if (!file.type.startsWith("image/")) {
+      setError("Please upload an image file.");
+      return;
+    }
+    setImageFile(file);
+    setProcessedSvg(null);
+    setError(null);
+    setActiveTab("original");
+    const url = URL.createObjectURL(file);
+    setImagePreviewUrl(url);
+  }, []);
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      setIsDragging(false);
+      handleFiles(e.dataTransfer.files);
+    },
+    [handleFiles]
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  const handleGenerate = useCallback(async () => {
+    if (!imageFile) return;
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("image", imageFile);
+      formData.append("style", selectedStyle);
+      formData.append("options", JSON.stringify(options[selectedStyle]));
+
+      const res = await fetch("/api/process", { method: "POST", body: formData });
+
+      if (!res.ok) {
+        const json = await res.json();
+        throw new Error(json.error || "Processing failed");
+      }
+
+      const svgText = await res.text();
+      setProcessedSvg(svgText);
+      setActiveTab("preview");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [imageFile, selectedStyle, options]);
+
+  const handleDownloadSvg = useCallback(() => {
+    if (!processedSvg) return;
+    const blob = new Blob([processedSvg], { type: "image/svg+xml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `plotter-${selectedStyle}.svg`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [processedSvg, selectedStyle]);
+
+  const handleDownloadGcode = useCallback(() => {
+    if (!processedSvg) return;
+    const gcode = svgToGcode(processedSvg, {
+      widthMm: gcodeWidthMm,
+      heightMm: gcodeHeightMm,
+      feedRate: gcodeFeedRate,
+      penUpCmd: gcodePenUpCmd,
+      penDownCmd: gcodePenDownCmd,
+    });
+    const blob = new Blob([gcode], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `plotter-${selectedStyle}.gcode`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [processedSvg, selectedStyle, gcodeWidthMm, gcodeHeightMm, gcodeFeedRate, gcodePenUpCmd, gcodePenDownCmd]);
+
+  useEffect(() => {
+    return () => {
+      if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
+    };
+  }, [imagePreviewUrl]);
+
+  const renderOptions = () => {
+    switch (selectedStyle) {
+      case "lineArt":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Edge Threshold" value={options.lineArt.threshold} min={10} max={120} step={1} onChange={(v) => setOpt("lineArt", "threshold", v)} />
+            <SliderRow label="Blur Sigma" value={options.lineArt.blur} min={0.5} max={3} step={0.1} onChange={(v) => setOpt("lineArt", "blur", v)} />
+          </div>
+        );
+      case "stippling":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Dot Count" value={options.stippling.numPoints} min={3000} max={40000} step={500} onChange={(v) => setOpt("stippling", "numPoints", v)} />
+            <SliderRow label="Max Dot Radius" value={options.stippling.maxRadius} min={1} max={5} step={0.1} onChange={(v) => setOpt("stippling", "maxRadius", v)} />
+          </div>
+        );
+      case "hatching":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Line Spacing" value={options.hatching.lineSpacing} min={4} max={16} step={1} onChange={(v) => setOpt("hatching", "lineSpacing", v)} />
+            <SliderRow label="Angle (deg)" value={options.hatching.angle} min={0} max={180} step={1} onChange={(v) => setOpt("hatching", "angle", v)} />
+            <SliderRow label="Threshold" value={options.hatching.threshold} min={0.3} max={0.9} step={0.01} onChange={(v) => setOpt("hatching", "threshold", v)} />
+          </div>
+        );
+      case "crosshatch":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Line Spacing" value={options.crosshatch.lineSpacing} min={4} max={16} step={1} onChange={(v) => setOpt("crosshatch", "lineSpacing", v)} />
+          </div>
+        );
+      case "spiral":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Spiral Spacing" value={options.spiral.spacing} min={4} max={14} step={0.5} onChange={(v) => setOpt("spiral", "spacing", v)} />
+            <SliderRow label="Max Displacement" value={options.spiral.maxDisplacement} min={3} max={14} step={0.5} onChange={(v) => setOpt("spiral", "maxDisplacement", v)} />
+          </div>
+        );
+      case "waves":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Row Spacing" value={options.waves.rowSpacing} min={6} max={20} step={1} onChange={(v) => setOpt("waves", "rowSpacing", v)} />
+            <SliderRow label="Max Amplitude" value={options.waves.maxAmplitude} min={4} max={18} step={0.5} onChange={(v) => setOpt("waves", "maxAmplitude", v)} />
+          </div>
+        );
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col">
+      {/* Navbar */}
+      <header className="border-b border-zinc-800 px-6 py-4 flex items-center gap-4">
+        <div>
+          <h1 className="text-lg font-bold tracking-widest text-white">LINE ART</h1>
+          <p className="text-xs text-zinc-500 tracking-wide">Photo to pen plotter converter</p>
+        </div>
+        <div className="flex-1" />
+        {processedSvg && (
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full bg-green-500" />
+            <span className="text-xs text-zinc-400">Art ready</span>
+          </div>
+        )}
+      </header>
+
+      {/* Main layout */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Left column - controls */}
+        <aside className="w-80 flex-shrink-0 border-r border-zinc-800 flex flex-col overflow-y-auto">
+          <div className="p-4 flex flex-col gap-5">
+            {/* Upload zone */}
+            <div>
+              <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                Image
+              </label>
+              <div
+                className={`relative border-2 border-dashed rounded-lg p-4 text-center cursor-pointer transition-colors ${
+                  isDragging
+                    ? "border-white bg-zinc-800"
+                    : "border-zinc-700 hover:border-zinc-500"
+                }`}
+                onDrop={handleDrop}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  className="hidden"
+                  onChange={(e) => handleFiles(e.target.files)}
+                />
+                {imagePreviewUrl ? (
+                  <div className="flex flex-col items-center gap-2">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={imagePreviewUrl}
+                      alt="Uploaded preview"
+                      className="max-h-32 max-w-full object-contain rounded"
+                    />
+                    <span className="text-xs text-zinc-500 truncate max-w-full">
+                      {imageFile?.name}
+                    </span>
+                    <span className="text-xs text-zinc-600">Click to change</span>
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center gap-2 py-4">
+                    <svg
+                      width="32"
+                      height="32"
+                      viewBox="0 0 32 32"
+                      fill="none"
+                      className="text-zinc-600"
+                    >
+                      <rect
+                        x="4"
+                        y="4"
+                        width="24"
+                        height="24"
+                        rx="3"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                      />
+                      <path
+                        d="M16 10 L16 22 M10 16 L22 16"
+                        stroke="currentColor"
+                        strokeWidth="1.5"
+                        strokeLinecap="round"
+                      />
+                    </svg>
+                    <span className="text-sm text-zinc-500">
+                      Drop image here
+                    </span>
+                    <span className="text-xs text-zinc-600">
+                      or click to browse
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Style grid */}
+            <div>
+              <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                Style
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                {styles.map((s) => (
+                  <button
+                    key={s.id}
+                    onClick={() => setSelectedStyle(s.id)}
+                    className={`flex flex-col items-start gap-1 p-3 rounded-lg border transition-colors text-left ${
+                      selectedStyle === s.id
+                        ? "bg-white text-zinc-950 border-white"
+                        : "bg-zinc-900 text-zinc-100 border-zinc-800 hover:border-zinc-600"
+                    }`}
+                  >
+                    <div
+                      className={`${
+                        selectedStyle === s.id ? "text-zinc-950" : "text-zinc-400"
+                      }`}
+                    >
+                      <StyleIcon id={s.id} />
+                    </div>
+                    <div>
+                      <div className="text-xs font-semibold leading-tight">
+                        {s.name}
+                      </div>
+                      <div
+                        className={`text-xs leading-tight mt-0.5 ${
+                          selectedStyle === s.id
+                            ? "text-zinc-500"
+                            : "text-zinc-500"
+                        }`}
+                      >
+                        {s.desc}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Options panel */}
+            <div>
+              <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-2">
+                Parameters
+              </label>
+              <div className="bg-zinc-900 border border-zinc-800 rounded-lg p-3">
+                {renderOptions()}
+              </div>
+            </div>
+
+            {/* Generate button */}
+            <button
+              onClick={handleGenerate}
+              disabled={!imageFile || isProcessing}
+              className={`w-full py-3 rounded-lg font-semibold text-sm tracking-wider transition-colors ${
+                !imageFile || isProcessing
+                  ? "bg-zinc-800 text-zinc-600 cursor-not-allowed"
+                  : "bg-white text-zinc-950 hover:bg-zinc-200 cursor-pointer"
+              }`}
+            >
+              {isProcessing ? (
+                <span className="flex items-center justify-center gap-2">
+                  <svg
+                    className="animate-spin"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                  >
+                    <circle
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeOpacity="0.2"
+                    />
+                    <path
+                      d="M12 2 A10 10 0 0 1 22 12"
+                      stroke="currentColor"
+                      strokeWidth="3"
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                  PROCESSING...
+                </span>
+              ) : (
+                "GENERATE"
+              )}
+            </button>
+
+            {error && (
+              <div className="bg-red-950 border border-red-800 rounded-lg p-3 text-xs text-red-300">
+                {error}
+              </div>
+            )}
+          </div>
+        </aside>
+
+        {/* Main content - preview */}
+        <main className="flex-1 flex flex-col overflow-hidden">
+          {/* Tabs */}
+          <div className="border-b border-zinc-800 px-4 pt-4 flex items-end gap-1">
+            <button
+              onClick={() => setActiveTab("original")}
+              className={`px-4 py-2 text-sm rounded-t-md transition-colors ${
+                activeTab === "original"
+                  ? "bg-zinc-900 text-zinc-100 border-t border-l border-r border-zinc-800"
+                  : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              Original
+            </button>
+            <button
+              onClick={() => setActiveTab("preview")}
+              disabled={!processedSvg}
+              className={`px-4 py-2 text-sm rounded-t-md transition-colors ${
+                activeTab === "preview"
+                  ? "bg-zinc-900 text-zinc-100 border-t border-l border-r border-zinc-800"
+                  : !processedSvg
+                  ? "text-zinc-700 cursor-not-allowed"
+                  : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              Art Preview
+            </button>
+            <div className="flex-1" />
+            {processedSvg && activeTab === "preview" && (
+              <div className="flex items-center gap-2 pb-2">
+                <button
+                  onClick={handleDownloadSvg}
+                  className="px-3 py-1.5 text-xs bg-zinc-900 border border-zinc-700 text-zinc-300 rounded hover:bg-zinc-800 transition-colors"
+                >
+                  Download SVG
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Preview area */}
+          <div className="flex-1 flex overflow-hidden">
+            <div className="flex-1 overflow-auto p-4 flex items-center justify-center">
+              {activeTab === "original" ? (
+                imagePreviewUrl ? (
+                  <div className="max-w-full max-h-full flex items-center justify-center">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={imagePreviewUrl}
+                      alt="Original"
+                      className="max-w-full max-h-[calc(100vh-180px)] object-contain rounded-lg shadow-2xl"
+                    />
+                  </div>
+                ) : (
+                  <div className="text-center text-zinc-600">
+                    <svg
+                      width="64"
+                      height="64"
+                      viewBox="0 0 64 64"
+                      fill="none"
+                      className="mx-auto mb-4 opacity-40"
+                    >
+                      <rect
+                        x="8"
+                        y="8"
+                        width="48"
+                        height="48"
+                        rx="6"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                      />
+                      <circle cx="22" cy="22" r="5" stroke="currentColor" strokeWidth="2" />
+                      <path
+                        d="M8 42 L20 30 L30 40 L42 26 L56 42"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                    <p className="text-sm">Upload an image to get started</p>
+                  </div>
+                )
+              ) : processedSvg ? (
+                <div className="max-w-full max-h-full flex items-center justify-center p-2">
+                  <div
+                    className="svg-preview rounded-lg shadow-2xl overflow-hidden"
+                    style={{ maxWidth: "100%", maxHeight: "calc(100vh - 200px)" }}
+                    dangerouslySetInnerHTML={{ __html: processedSvg }}
+                  />
+                </div>
+              ) : null}
+            </div>
+
+            {/* Export panel - right sidebar when art is ready */}
+            {processedSvg && (
+              <div className="w-64 flex-shrink-0 border-l border-zinc-800 overflow-y-auto">
+                <div className="p-4 flex flex-col gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">
+                      Export
+                    </label>
+                    <button
+                      onClick={handleDownloadSvg}
+                      className="w-full py-2.5 rounded-lg text-sm font-semibold bg-white text-zinc-950 hover:bg-zinc-200 transition-colors"
+                    >
+                      Download SVG
+                    </button>
+                  </div>
+
+                  <div className="border-t border-zinc-800 pt-4">
+                    <label className="block text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">
+                      G-code Settings
+                    </label>
+                    <div className="flex flex-col gap-3">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="flex flex-col gap-1">
+                          <span className="text-xs text-zinc-500">Width (mm)</span>
+                          <input
+                            type="number"
+                            value={gcodeWidthMm}
+                            min={50}
+                            max={1000}
+                            onChange={(e) => setGcodeWidthMm(Number(e.target.value))}
+                            className="w-full"
+                          />
+                        </div>
+                        <div className="flex flex-col gap-1">
+                          <span className="text-xs text-zinc-500">Height (mm)</span>
+                          <input
+                            type="number"
+                            value={gcodeHeightMm}
+                            min={50}
+                            max={1000}
+                            onChange={(e) => setGcodeHeightMm(Number(e.target.value))}
+                            className="w-full"
+                          />
+                        </div>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-zinc-500">Feed Rate (mm/min)</span>
+                        <input
+                          type="number"
+                          value={gcodeFeedRate}
+                          min={100}
+                          max={20000}
+                          step={100}
+                          onChange={(e) => setGcodeFeedRate(Number(e.target.value))}
+                          className="w-full"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-zinc-500">Pen Up Command</span>
+                        <input
+                          type="text"
+                          value={gcodePenUpCmd}
+                          onChange={(e) => setGcodePenUpCmd(e.target.value)}
+                          className="w-full"
+                        />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <span className="text-xs text-zinc-500">Pen Down Command</span>
+                        <input
+                          type="text"
+                          value={gcodePenDownCmd}
+                          onChange={(e) => setGcodePenDownCmd(e.target.value)}
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleDownloadGcode}
+                    className="w-full py-2.5 rounded-lg text-sm font-semibold bg-zinc-800 text-zinc-100 border border-zinc-700 hover:bg-zinc-700 transition-colors"
+                  >
+                    Download G-code
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
