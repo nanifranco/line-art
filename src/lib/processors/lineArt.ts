@@ -77,8 +77,11 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
     const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
     const brightness = smoothed[by * width + bx] / 255;
 
-    // Rejection sampling: dark zones have much higher acceptance
-    if (rng() > Math.pow(1 - brightness, 1.6)) continue;
+    // Rejection sampling with a minimum floor so even bright areas (background)
+    // get sparse strokes — density contrast creates the tonal range, not absence
+    const minAcceptance = 0.1;
+    const acceptance = minAcceptance + (1 - minAcceptance) * Math.pow(1 - brightness, 1.8);
+    if (rng() > acceptance) continue;
 
     // Adaptive length: longer in flat areas, shorter at sharp edges
     const gMag0 = Math.sqrt(gx[by * width + bx] ** 2 + gy[by * width + bx] ** 2);
@@ -93,7 +96,7 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
       const ix = Math.round(x), iy = Math.round(y);
       const idx = iy * width + ix;
 
-      if (gray[idx] / 255 > 0.93) break;
+      if (gray[idx] / 255 > 0.97) break;
 
       const dGx = gx[idx], dGy = gy[idx];
       const gradMag = Math.sqrt(dGx * dGx + dGy * dGy);
