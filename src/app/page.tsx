@@ -2,6 +2,12 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { svgToGcode } from "@/lib/gcodeGenerator";
+import { processLineArt } from "@/lib/processors/lineArt";
+import { processStippling } from "@/lib/processors/stippling";
+import { processHatching } from "@/lib/processors/hatching";
+import { processCrosshatch } from "@/lib/processors/crosshatch";
+import { processSpiral } from "@/lib/processors/spiral";
+import { processWaves } from "@/lib/processors/waves";
 
 type StyleType =
   | "lineArt"
@@ -44,6 +50,34 @@ const styles: StyleDef[] = [
   { id: "spiral", name: "Spiral", desc: "Archimedean continuous path", icon: "SP" },
   { id: "waves", name: "Waves", desc: "Sine rows by brightness", icon: "WA" },
 ];
+
+async function processImageClientSide(
+  file: File,
+  style: string,
+  options: Record<string, number>
+): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  const MAX = 700;
+  const scale = Math.min(1, MAX / Math.max(bitmap.width, bitmap.height));
+  const w = Math.round(bitmap.width * scale);
+  const h = Math.round(bitmap.height * scale);
+
+  const canvas = new OffscreenCanvas(w, h);
+  const ctx = canvas.getContext('2d')!;
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  const imageData = ctx.getImageData(0, 0, w, h);
+  bitmap.close();
+
+  switch (style) {
+    case 'lineArt': return processLineArt(imageData, options);
+    case 'stippling': return processStippling(imageData, options);
+    case 'hatching': return processHatching(imageData, options);
+    case 'crosshatch': return processCrosshatch(imageData, options);
+    case 'spiral': return processSpiral(imageData, options);
+    case 'waves': return processWaves(imageData, options);
+    default: throw new Error('Unknown style');
+  }
+}
 
 function SliderRow({
   label,
@@ -205,19 +239,11 @@ export default function Home() {
     setError(null);
 
     try {
-      const formData = new FormData();
-      formData.append("image", imageFile);
-      formData.append("style", selectedStyle);
-      formData.append("options", JSON.stringify(options[selectedStyle]));
-
-      const res = await fetch("/api/process", { method: "POST", body: formData });
-
-      if (!res.ok) {
-        const json = await res.json();
-        throw new Error(json.error || "Processing failed");
-      }
-
-      const svgText = await res.text();
+      const svgText = await processImageClientSide(
+        imageFile,
+        selectedStyle,
+        options[selectedStyle] as Record<string, number>
+      );
       setProcessedSvg(svgText);
       setActiveTab("preview");
     } catch (err) {
