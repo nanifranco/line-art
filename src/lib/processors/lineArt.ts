@@ -6,11 +6,42 @@ interface LineArtOptions {
   noiseInfluence?: number;
 }
 
-function computeGradient(
-  data: Uint8Array,
-  width: number,
-  height: number
-): { gx: Float32Array; gy: Float32Array } {
+// Separable 1D Gaussian — O(n·k) instead of O(n·k²) for large sigmas
+function separableBlur(data: Uint8Array, width: number, height: number, sigma: number): Uint8Array {
+  const k = Math.max(3, Math.ceil(sigma * 2.5) * 2 + 1);
+  const half = Math.floor(k / 2);
+  const kernel = new Float32Array(k);
+  let kSum = 0;
+  for (let i = 0; i < k; i++) {
+    const v = Math.exp(-((i - half) ** 2) / (2 * sigma * sigma));
+    kernel[i] = v; kSum += v;
+  }
+  for (let i = 0; i < k; i++) kernel[i] /= kSum;
+
+  const tmp = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let val = 0;
+      for (let i = 0; i < k; i++) {
+        val += data[y * width + Math.max(0, Math.min(width - 1, x + i - half))] * kernel[i];
+      }
+      tmp[y * width + x] = Math.round(val);
+    }
+  }
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let val = 0;
+      for (let i = 0; i < k; i++) {
+        val += tmp[Math.max(0, Math.min(height - 1, y + i - half)) * width + x] * kernel[i];
+      }
+      out[y * width + x] = Math.round(val);
+    }
+  }
+  return out;
+}
+
+function computeGradient(data: Uint8Array, width: number, height: number) {
   const gx = new Float32Array(width * height);
   const gy = new Float32Array(width * height);
   for (let y = 1; y < height - 1; y++) {
@@ -23,7 +54,6 @@ function computeGradient(
   return { gx, gy };
 }
 
-// Smooth angle noise table — interpolated as unit vectors to avoid wrap artifacts
 function buildNoiseTable(size: number, seed: number): Float32Array {
   const t = new Float32Array(size * size);
   let s = seed;
@@ -33,27 +63,97 @@ function buildNoiseTable(size: number, seed: number): Float32Array {
 }
 
 function sampleNoise(x: number, y: number, table: Float32Array, size: number): number {
-  const xi = Math.floor(x) & (size - 1);
-  const yi = Math.floor(y) & (size - 1);
-  const xf = x - Math.floor(x);
-  const yf = y - Math.floor(y);
-  const u = xf * xf * (3 - 2 * xf);
-  const v = yf * yf * (3 - 2 * yf);
-  const xi1 = (xi + 1) & (size - 1);
-  const yi1 = (yi + 1) & (size - 1);
-  const a00 = table[yi  * size + xi ],  a10 = table[yi  * size + xi1];
-  const a01 = table[yi1 * size + xi ],  a11 = table[yi1 * size + xi1];
+  const xi = Math.floor(x) & (size - 1), yi = Math.floor(y) & (size - 1);
+  const xf = x - Math.floor(x), yf = y - Math.floor(y);
+  const u = xf * xf * (3 - 2 * xf), v = yf * yf * (3 - 2 * yf);
+  const xi1 = (xi + 1) & (size - 1), yi1 = (yi + 1) & (size - 1);
+  const a00 = table[yi * size + xi], a10 = table[yi * size + xi1];
+  const a01 = table[yi1 * size + xi], a11 = table[yi1 * size + xi1];
   const cx = Math.cos(a00)*(1-u)*(1-v) + Math.cos(a10)*u*(1-v) + Math.cos(a01)*(1-u)*v + Math.cos(a11)*u*v;
   const cy = Math.sin(a00)*(1-u)*(1-v) + Math.sin(a10)*u*(1-v) + Math.sin(a01)*(1-u)*v + Math.sin(a11)*u*v;
   return Math.atan2(cy, cx);
+}
+
+// Average brightness along the image border — used to estimate background color
+function borderBrightness(gray: Uint8Array, width: number, height: number): number {
+  const m = Math.max(3, Math.floor(Math.min(width, height) * 0.07));
+  let sum = 0, count = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (x < m || x >= width - m || y < m || y >= height - m) {
+        sum += gray[y * width + x]; count++;
+      }
+    }
+  }
+  return sum / count;
+}
+
+// Subject importance mask:
+// high value = likely subject, low value = likely background
+function buildSubjectMask(gray: Uint8Array, width: number, height: number): Uint8Array {
+  const bgVal = borderBrightness(gray, width, height);
+  const cx = width / 2, cy = height / 2;
+  const maxD = Math.sqrt(cx * cx + cy * cy);
+  const raw = new Uint8Array(width * height);
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      // How different is this pixel from the estimated background?
+      const diff = Math.min(255, Math.abs(gray[y * width + x] - bgVal) * 2.8);
+      // Soft center-of-frame bias (subject is usually not at the corners)
+      const dx = (x - cx) / maxD, dy = (y - cy) / maxD;
+      const center = Math.exp(-(dx * dx + dy * dy) * 1.4) * 75;
+      raw[y * width + x] = Math.min(255, diff + center);
+    }
+  }
+
+  // Blur heavily so the mask has smooth, gradual boundaries
+  return separableBlur(raw, width, height, 7);
+}
+
+// Sobel applied to the mask → gives us the silhouette boundary
+function maskEdges(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(width * height);
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const p = (dx: number, dy: number) => mask[(y + dy) * width + (x + dx)];
+      const gx = -p(-1,-1) - 2*p(-1,0) - p(-1,1) + p(1,-1) + 2*p(1,0) + p(1,1);
+      const gy = -p(-1,-1) - 2*p(0,-1) - p(1,-1) + p(-1,1) + 2*p(0,1) + p(1,1);
+      out[y * width + x] = Math.min(255, Math.sqrt(gx * gx + gy * gy) / 4);
+    }
+  }
+  return out;
+}
+
+// Local texture intensity: std-deviation of 7×7 neighborhood
+function localTexture(gray: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(width * height);
+  const r = 3, n = (r * 2 + 1) ** 2;
+  for (let y = r; y < height - r; y++) {
+    for (let x = r; x < width - r; x++) {
+      let sum = 0, sumSq = 0;
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const v = gray[(y + dy) * width + (x + dx)];
+          sum += v; sumSq += v * v;
+        }
+      }
+      const mean = sum / n;
+      out[y * width + x] = Math.min(255, Math.sqrt(Math.max(0, sumSq / n - mean * mean)) * 2);
+    }
+  }
+  return out;
 }
 
 export function processLineArt(imageData: ImageData, options: LineArtOptions = {}): string {
   const { numStrokes = 10000, strokeLength = 14, noiseInfluence = 0.35 } = options;
   const { width, height } = imageData;
 
-  const gray = toGrayscale(imageData);
-  const smoothed = gaussianBlur(gray, width, height, 1.2);
+  const gray      = toGrayscale(imageData);
+  const smoothed  = gaussianBlur(gray, width, height, 1.2);
+  const subject   = buildSubjectMask(gray, width, height);
+  const boundary  = maskEdges(subject, width, height);
+  const texture   = localTexture(gray, width, height);
   const { gx, gy } = computeGradient(smoothed, width, height);
 
   const NOISE_SIZE = 64;
@@ -63,74 +163,98 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
   let seed = 48271;
   const rng = () => { seed = (seed * 1664525 + 1013904223) & 0xffffffff; return (seed >>> 0) / 0xffffffff; };
 
-  const pathParts: string[] = [];
-  let generated = 0;
-  let attempts = 0;
-  const maxAttempts = numStrokes * 20;
-
-  while (generated < numStrokes && attempts < maxAttempts) {
-    attempts++;
-
-    const sx = rng() * width;
-    const sy = rng() * height;
-    const bx = Math.max(0, Math.min(width  - 1, Math.round(sx)));
-    const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
-    const brightness = smoothed[by * width + bx] / 255;
-
-    // Hard cutoff: background (very bright) gets zero strokes
-    const cutoff = 0.88;
-    if (brightness >= cutoff) continue;
-    // Gentle curve so mid-tones (skin ~0.6-0.75) still receive many strokes
-    const acceptance = Math.pow(1 - brightness / cutoff, 0.7);
-    if (rng() > acceptance) continue;
-
-    // Adaptive length: longer in flat areas, shorter at sharp edges
-    const gMag0 = Math.sqrt(gx[by * width + bx] ** 2 + gy[by * width + bx] ** 2);
-    const steps = Math.round(strokeLength * (1 + 1 / (gMag0 / 8 + 1)));
-
-    const xs: number[] = [sx];
-    const ys: number[] = [sy];
+  // Trace a single stroke from (sx, sy)
+  function trace(sx: number, sy: number, steps: number, noiseW: number): string | null {
+    const xs = [sx], ys = [sy];
     let x = sx, y = sy;
-
     for (let s = 0; s < steps; s++) {
       if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) break;
       const ix = Math.round(x), iy = Math.round(y);
       const idx = iy * width + ix;
-
-      if (gray[idx] / 255 >= 0.88) break;
+      if (subject[idx] < 28) break; // stop when leaving subject zone
 
       const dGx = gx[idx], dGy = gy[idx];
       const gradMag = Math.sqrt(dGx * dGx + dGy * dGy);
-
-      // Perpendicular to gradient → strokes flow along iso-brightness contours
-      const flowAngle = Math.atan2(dGx, -dGy);
+      const flowAngle = Math.atan2(dGx, -dGy); // perpendicular to gradient → follows iso-contours
       const noiseAngle = sampleNoise(x * noiseScale, y * noiseScale, noiseTable, NOISE_SIZE);
+      const blend = Math.min(gradMag / 25, 1);
+      const nw = noiseW * (1 - blend);
 
-      const blendFactor = Math.min(gradMag / 25, 1);
-      const noiseW = noiseInfluence * (1 - blendFactor);
-
-      // Blend as unit vectors (no angle-wrap artifacts)
-      const bvx = Math.cos(flowAngle) * (1 - noiseW) + Math.cos(noiseAngle) * noiseW;
-      const bvy = Math.sin(flowAngle) * (1 - noiseW) + Math.sin(noiseAngle) * noiseW;
+      const bvx = Math.cos(flowAngle) * (1 - nw) + Math.cos(noiseAngle) * nw;
+      const bvy = Math.sin(flowAngle) * (1 - nw) + Math.sin(noiseAngle) * nw;
       const mag = Math.sqrt(bvx * bvx + bvy * bvy) + 1e-6;
-
       x += (bvx / mag) * 1.4;
       y += (bvy / mag) * 1.4;
-      xs.push(x);
-      ys.push(y);
+      xs.push(x); ys.push(y);
     }
-
-    if (xs.length < 3) continue;
-
+    if (xs.length < 3) return null;
     let d = `M${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
     for (let i = 1; i < xs.length; i++) d += ` L${xs[i].toFixed(1)},${ys[i].toFixed(1)}`;
-    pathParts.push(d);
-    generated++;
+    return d;
+  }
+
+  const silPaths: string[] = [];
+  const strPaths: string[] = [];
+  const scrPaths: string[] = [];
+
+  // ── LAYER 1: SILHOUETTE ─────────────────────────────────────────────────
+  // Long strokes placed at the mask boundary → defines the outer form clearly
+  const silBudget = Math.max(400, Math.floor(numStrokes * 0.06));
+  let silGen = 0, silTry = 0;
+  while (silGen < silBudget && silTry < silBudget * 25) {
+    silTry++;
+    const sx = rng() * width, sy = rng() * height;
+    const bx = Math.max(0, Math.min(width - 1, Math.round(sx)));
+    const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
+    if (rng() > (boundary[by * width + bx] / 255) * 2.5) continue;
+    const s = trace(sx, sy, Math.round(strokeLength * 2.8), 0.04);
+    if (s) { silPaths.push(s); silGen++; }
+  }
+
+  // ── LAYER 2: STRUCTURE ──────────────────────────────────────────────────
+  // Medium strokes in high-gradient or high-texture areas inside the subject
+  const strBudget = Math.floor(numStrokes * 0.24);
+  let strGen = 0, strTry = 0;
+  while (strGen < strBudget && strTry < strBudget * 15) {
+    strTry++;
+    const sx = rng() * width, sy = rng() * height;
+    const bx = Math.max(0, Math.min(width - 1, Math.round(sx)));
+    const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
+    const mask = subject[by * width + bx] / 255;
+    if (mask < 0.3) continue;
+    const gMag = Math.sqrt(gx[by * width + bx] ** 2 + gy[by * width + bx] ** 2);
+    const tex  = texture[by * width + bx] / 255;
+    if (rng() > Math.min(1, (gMag / 18 + tex * 0.6) * mask)) continue;
+    const s = trace(sx, sy, Math.round(strokeLength * 1.5), 0.1);
+    if (s) { strPaths.push(s); strGen++; }
+  }
+
+  // ── LAYER 3: DENSITY SCRIBBLES ──────────────────────────────────────────
+  // Short strokes weighted by (subjectness × darkness × texture)
+  // Bright areas inside the subject still get some strokes (skin, etc.)
+  // but far fewer than shadowed or textured zones
+  const scrBudget = numStrokes - silGen - strGen;
+  let scrGen = 0, scrTry = 0;
+  while (scrGen < scrBudget && scrTry < scrBudget * 18) {
+    scrTry++;
+    const sx = rng() * width, sy = rng() * height;
+    const bx = Math.max(0, Math.min(width - 1, Math.round(sx)));
+    const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
+    const mask = subject[by * width + bx] / 255;
+    const bright = smoothed[by * width + bx] / 255;
+    const tex    = texture[by * width + bx] / 255;
+    // Must be in subject; dark + textured zones attract most strokes
+    const acc = Math.min(1, Math.pow(mask, 0.7) * (0.22 + 0.78 * Math.pow(1 - bright, 0.65) + 0.3 * tex));
+    if (rng() > acc) continue;
+    const s = trace(sx, sy, strokeLength, noiseInfluence);
+    if (s) { scrPaths.push(s); scrGen++; }
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">
   <rect width="${width}" height="${height}" fill="white"/>
-  <path d="${pathParts.join(' ')}" fill="none" stroke="black" stroke-width="0.55" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${scrPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.5"  stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${strPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${silPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.9"  stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 }
