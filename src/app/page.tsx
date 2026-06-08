@@ -8,6 +8,7 @@ import { processHatching } from "@/lib/processors/hatching";
 import { processCrosshatch } from "@/lib/processors/crosshatch";
 import { processSpiral } from "@/lib/processors/spiral";
 import { processTypewriter } from "@/lib/processors/typewriter";
+import { processEngraving } from "@/lib/processors/engraving";
 import { analyzeImageWithClaude, buildEnhancedSubjectMask } from "@/lib/claudeVision";
 
 type StyleType =
@@ -16,7 +17,8 @@ type StyleType =
   | "hatching"
   | "crosshatch"
   | "spiral"
-  | "typewriter";
+  | "typewriter"
+  | "engraving";
 
 interface StyleOptions {
   lineArt: { numStrokes: number; strokeLength: number; noiseInfluence: number };
@@ -25,6 +27,7 @@ interface StyleOptions {
   crosshatch: { lineSpacing: number };
   spiral: { spacing: number; maxDisplacement: number };
   typewriter: { cols: number; contrast: number };
+  engraving: { minSpacing: number; maxSpacing: number };
 }
 
 const PAPER_SIZES: Record<string, [number, number]> = {
@@ -46,6 +49,7 @@ const defaultOptions: StyleOptions = {
   crosshatch: { lineSpacing: 8 },
   spiral: { spacing: 7, maxDisplacement: 8 },
   typewriter: { cols: 80, contrast: 1.2 },
+  engraving: { minSpacing: 2, maxSpacing: 18 },
 };
 
 interface StyleDef {
@@ -56,7 +60,8 @@ interface StyleDef {
 }
 
 const styles: StyleDef[] = [
-  { id: "lineArt", name: "Line Art", desc: "Sobel edge detection + vector trace", icon: "LA" },
+  { id: "lineArt", name: "Line Art", desc: "Flow field density rendering", icon: "LA" },
+  { id: "engraving", name: "Engraving", desc: "Outline + horizontal shading", icon: "EN" },
   { id: "stippling", name: "Stippling", desc: "Dot density from brightness", icon: "ST" },
   { id: "hatching", name: "Hatching", desc: "Diagonal line shading", icon: "HA" },
   { id: "crosshatch", name: "Crosshatch", desc: "Multi-angle line layers", icon: "CH" },
@@ -84,6 +89,7 @@ async function processImageClientSide(
 
   switch (style) {
     case 'lineArt': return processLineArt(imageData, { ...options, subjectMask });
+    case 'engraving': return processEngraving(imageData, options);
     case 'stippling': return processStippling(imageData, options);
     case 'hatching': return processHatching(imageData, options);
     case 'crosshatch': return processCrosshatch(imageData, options);
@@ -185,6 +191,18 @@ function StyleIcon({ id }: { id: StyleType }) {
     return (
       <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1.2">
         <path d="M14 14 C14 12 16 11 17 12 C19 13 19 16 17 18 C15 20 11 20 9 18 C6 15 6 10 9 7 C12 4 18 4 21 7 C24 11 24 18 21 22" />
+      </svg>
+    );
+  }
+  if (id === "engraving") {
+    return (
+      <svg width={size} height={size} viewBox="0 0 28 28" fill="none" stroke="currentColor" strokeWidth="1">
+        <ellipse cx="14" cy="14" rx="9" ry="11" strokeWidth="1.4"/>
+        <line x1="5" y1="9" x2="23" y2="9" />
+        <line x1="5" y1="12" x2="23" y2="12" />
+        <line x1="5" y1="15" x2="23" y2="15" />
+        <line x1="6" y1="18" x2="22" y2="18" />
+        <line x1="8" y1="21" x2="20" y2="21" />
       </svg>
     );
   }
@@ -408,6 +426,13 @@ export default function Home() {
           <div className="flex flex-col gap-3">
             <SliderRow label="Columns" value={options.typewriter.cols} min={40} max={120} step={5} onChange={(v) => setOpt("typewriter", "cols", v)} />
             <SliderRow label="Contrast" value={options.typewriter.contrast} min={0.8} max={2} step={0.05} onChange={(v) => setOpt("typewriter", "contrast", v)} />
+          </div>
+        );
+      case "engraving":
+        return (
+          <div className="flex flex-col gap-3">
+            <SliderRow label="Min Spacing (dark)" value={options.engraving.minSpacing} min={1} max={6} step={1} onChange={(v) => setOpt("engraving", "minSpacing", v)} />
+            <SliderRow label="Max Spacing (light)" value={options.engraving.maxSpacing} min={8} max={40} step={1} onChange={(v) => setOpt("engraving", "maxSpacing", v)} />
           </div>
         );
     }
