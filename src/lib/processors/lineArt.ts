@@ -172,11 +172,11 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
       if (x < 1 || x >= width - 1 || y < 1 || y >= height - 1) break;
       const ix = Math.round(x), iy = Math.round(y);
       const idx = iy * width + ix;
-      if (subject[idx] < 28) break; // stop when leaving subject zone
+      if (subject[idx] < 50) break; // stop when leaving subject zone
 
       const dGx = gx[idx], dGy = gy[idx];
       const gradMag = Math.sqrt(dGx * dGx + dGy * dGy);
-      const flowAngle = Math.atan2(dGx, -dGy); // perpendicular to gradient → follows iso-contours
+      const flowAngle = Math.atan2(dGx, -dGy);
       const noiseAngle = sampleNoise(x * noiseScale, y * noiseScale, noiseTable, NOISE_SIZE);
       const blend = Math.min(gradMag / 25, 1);
       const nw = noiseW * (1 - blend);
@@ -196,10 +196,13 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
 
   const silPaths: string[] = [];
   const strPaths: string[] = [];
-  const scrPaths: string[] = [];
+  // 4 stroke-weight buckets for scribbles: dark→thick, light→thin
+  const scr0: string[] = []; // brightness <0.30  → width 0.90
+  const scr1: string[] = []; // brightness <0.50  → width 0.65
+  const scr2: string[] = []; // brightness <0.70  → width 0.42
+  const scr3: string[] = []; // brightness ≥0.70  → width 0.24
 
   // ── LAYER 1: SILHOUETTE ─────────────────────────────────────────────────
-  // Long strokes placed at the mask boundary → defines the outer form clearly
   const silBudget = Math.max(400, Math.floor(numStrokes * 0.06));
   let silGen = 0, silTry = 0;
   while (silGen < silBudget && silTry < silBudget * 25) {
@@ -213,8 +216,7 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
   }
 
   // ── LAYER 2: STRUCTURE ──────────────────────────────────────────────────
-  // Medium strokes in high-gradient or high-texture areas inside the subject
-  const strBudget = Math.floor(numStrokes * 0.24);
+  const strBudget = Math.floor(numStrokes * 0.22);
   let strGen = 0, strTry = 0;
   while (strGen < strBudget && strTry < strBudget * 15) {
     strTry++;
@@ -222,7 +224,7 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
     const bx = Math.max(0, Math.min(width - 1, Math.round(sx)));
     const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
     const mask = subject[by * width + bx] / 255;
-    if (mask < 0.3) continue;
+    if (mask < 0.45) continue; // hard background gate
     const gMag = Math.sqrt(gx[by * width + bx] ** 2 + gy[by * width + bx] ** 2);
     const tex  = texture[by * width + bx] / 255;
     if (rng() > Math.min(1, (gMag / 18 + tex * 0.6) * mask)) continue;
@@ -230,10 +232,7 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
     if (s) { strPaths.push(s); strGen++; }
   }
 
-  // ── LAYER 3: DENSITY SCRIBBLES ──────────────────────────────────────────
-  // Short strokes weighted by (subjectness × darkness × texture)
-  // Bright areas inside the subject still get some strokes (skin, etc.)
-  // but far fewer than shadowed or textured zones
+  // ── LAYER 3: DENSITY SCRIBBLES (4 weight buckets) ───────────────────────
   const scrBudget = numStrokes - silGen - strGen;
   let scrGen = 0, scrTry = 0;
   while (scrGen < scrBudget && scrTry < scrBudget * 18) {
@@ -241,21 +240,39 @@ export function processLineArt(imageData: ImageData, options: LineArtOptions = {
     const sx = rng() * width, sy = rng() * height;
     const bx = Math.max(0, Math.min(width - 1, Math.round(sx)));
     const by = Math.max(0, Math.min(height - 1, Math.round(sy)));
-    const mask = subject[by * width + bx] / 255;
+    const maskNorm = subject[by * width + bx] / 255;
+
+    // Hard background gate — no strokes outside subject
+    if (maskNorm < 0.42) continue;
+    const maskFactor = Math.min(1, (maskNorm - 0.42) / 0.58);
+
     const bright = smoothed[by * width + bx] / 255;
     const tex    = texture[by * width + bx] / 255;
-    // Must be in subject; dark + textured zones attract most strokes
-    const acc = Math.min(1, Math.pow(mask, 0.7) * (0.22 + 0.78 * Math.pow(1 - bright, 0.65) + 0.3 * tex));
+    // Density: dark zones get many strokes, bright zones get few (but never zero)
+    const density = 0.12 + 0.88 * Math.pow(1 - bright, 0.6) + 0.28 * tex;
+    const acc = Math.min(1, maskFactor * density);
     if (rng() > acc) continue;
+
     const s = trace(sx, sy, strokeLength, noiseInfluence);
-    if (s) { scrPaths.push(s); scrGen++; }
+    if (!s) continue;
+
+    // Route to weight bucket based on local brightness
+    if (bright < 0.30)      scr0.push(s);
+    else if (bright < 0.50) scr1.push(s);
+    else if (bright < 0.70) scr2.push(s);
+    else                    scr3.push(s);
+    scrGen++;
   }
 
+  const w = width, h = height;
   return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}">
-  <rect width="${width}" height="${height}" fill="white"/>
-  <path d="${scrPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.5"  stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="${strPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.65" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="${silPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.9"  stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">
+  <rect width="${w}" height="${h}" fill="white"/>
+  <path d="${scr3.join(' ')}" fill="none" stroke="black" stroke-width="0.24" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${scr2.join(' ')}" fill="none" stroke="black" stroke-width="0.42" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${scr1.join(' ')}" fill="none" stroke="black" stroke-width="0.65" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${scr0.join(' ')}" fill="none" stroke="black" stroke-width="0.90" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${strPaths.join(' ')}" fill="none" stroke="black" stroke-width="0.75" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${silPaths.join(' ')}" fill="none" stroke="black" stroke-width="1.1"  stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 }
